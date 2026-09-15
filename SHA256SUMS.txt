@@ -1,0 +1,17 @@
+8274e6915d06f14fb80ce913d829423cc4c1c4d76717bba97c5be55e44ce2b3a  ./esp32-bit-pirate-atom-lite-s3-upstream.bin
+4c791f889e392fa4445775563dda695ae52b68667ccae14cfeb0caf3c3ac9ee8  ./esp32-bit-pirate-cardputer-adv-upstream.bin
+34f5d67f09db9b1b8e414202ba73de9ef91ff9014501f08283da2bf05ab921d2  ./esp32-bit-pirate-cardputer-upstream.bin
+0e7e8f4feb17e0e831e84eccec8cd251d34f218ce6fb1c4ecc380aca92957046  ./esp32-bit-pirate-custom-upstream.bin
+14f06c740c022b65af43691b78124a23ef94a2ffdc7073dd9eee428ee65a7111  ./esp32-bit-pirate-heltec_wifi_lora_32_V3-upstream.bin
+30ca57de3409250fdc6fc318162c613c5f600d4e7c71c5bd29526a434d2f5426  ./esp32-bit-pirate-heltec_wifi_lora_32_V4-upstream.bin
+e5d49b4a14eba229aad30a80dc3fe056fb483122bacf17fb004ac42a493e8c09  ./esp32-bit-pirate-m5stack-stamps3-upstream.bin
+3a069796a1b5ae48f0487c95a1f929bb5830d128c790c7d1f4cbbf04215ad6a3  ./esp32-bit-pirate-m5stack-sticks3-upstream.bin
+b28566856df372b1fad32c3b387e0aaaf770af28002144e872fa434b8bdc6f85  ./esp32-bit-pirate-s3-devkit-n16-r8-upstream.bin
+6ac877b6c1c0086ae4a563247af78dc9d95618d47ff4b8ce257c07983d869846  ./esp32-bit-pirate-s3-devkit-upstream.bin
+3f2f9fd5f6e966c1d142ad0a335683de931eb92cb69bebe55a75bcf54552e9bf  ./esp32-bit-pirate-t-display-s3-upstream.bin
+46421289c277a0077c3d180b3e33919674ee8583399234f6110e81b7c87478a8  ./esp32-bit-pirate-t-embed-s3-cc1101-upstream.bin
+631b6021b73ea9cf0e6a8f6d3a8cc90c001f3e95837cae50a70dde307d55d654  ./esp32-bit-pirate-t-embed-s3-cc1101plus-upstream.bin
+0dfa26d335ffec467a62f67b163271cde08ca6c362d3f24ae43c39619eb9c0bc  ./esp32-bit-pirate-t-embed-s3-upstream.bin
+8d7748e6076e8b77ec7f1d6fdb5747cd30d2f8c4da0685268703d8e622662e1f  ./esp32-bit-pirate-vision-master-t190-upstream.bin
+1d2e6f65db49f41b40d0a05451b9560f2b12189d788e230524895a2cc6c986ce  ./esp32-bit-pirate-waveshare-s3-geek-upstream.bin
+8241880aacfb0d2977557c485fb3213a6c09c06e5c826eed040de17b8dc96354  ./esp32-bit-pirate-xiao-esp32s3-upstream.bin
