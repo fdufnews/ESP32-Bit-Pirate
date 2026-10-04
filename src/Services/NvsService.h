@@ -8,20 +8,8 @@
 #endif
 #include <cstdint>
 #include <string>
-#include "States/GlobalState.h"
+#include "Enums/OneShotBootMode.h"
 #include "Interfaces/INvsService.h"
-
-enum class OneShotBootMode : uint8_t {
-    None = 0,
-    UsbUartBridge = 1,
-    FlashromSerprog = 2,
-    SumpLogicAnalyzer = 3,
-    OpenOcdBusPirate = 4,
-    AvrDudeBusPirate = 6,
-    InfraredToy = 7,
-    SubGhzRawCdc = 8,
-    Bpio2 = 9,
-};
 
 class NvsService : public INvsService {
 public:
@@ -76,7 +64,6 @@ public:
 
 private:
     Preferences preferences;
-    GlobalState& globalState = GlobalState::getInstance();
 };
 
 #endif // NVS_SERVICE_H

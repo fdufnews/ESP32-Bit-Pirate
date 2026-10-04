@@ -8,7 +8,7 @@ NvsService::~NvsService() {
 
 void NvsService::open() {
     // Open nvs namespace
-    preferences.begin(globalState.getNvsNamespace(), false);
+    preferences.begin(NVS_NAMESPACE, false);
 }
 
 void NvsService::close() {
@@ -47,17 +47,17 @@ void NvsService::clearNamespace() {
 }
 
 void NvsService::saveOneShotBootMode(OneShotBootMode mode) {
-    preferences.putUChar("oneshot_boot", static_cast<uint8_t>(mode));
+    preferences.putUChar(ONE_SHOT_BOOT_KEY, static_cast<uint8_t>(mode));
 }
 
 OneShotBootMode NvsService::getOneShotBootMode() {
     return static_cast<OneShotBootMode>(
-        preferences.getUChar("oneshot_boot", static_cast<uint8_t>(OneShotBootMode::None))
+        preferences.getUChar(ONE_SHOT_BOOT_KEY, static_cast<uint8_t>(OneShotBootMode::None))
     );
 }
 
 void NvsService::clearOneShotBootMode() {
-    preferences.remove("oneshot_boot");
+    preferences.remove(ONE_SHOT_BOOT_KEY);
 }
 
 OneShotBootMode NvsService::consumeOneShotBootMode() {
