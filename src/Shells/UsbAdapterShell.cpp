@@ -54,6 +54,10 @@ void UsbAdapterShell::run() {
         rebootBpio2();
         return;
     }
+    if (choice == 8) {
+        rebootSdrCdc();
+        return;
+    }
     
     terminalView.println("Exiting USB adapters...\n");
 }
@@ -371,6 +375,19 @@ void UsbAdapterShell::rebootInfraredToy() {
         "USB IR Toy / LIRC adapter",
         "The device will expose one CDC serial port for LIRC's irtoy driver.",
         "Example: mode2 --driver=irtoy --device=/dev/ttyACM0"
+    );
+}
+
+void UsbAdapterShell::rebootSdrCdc() {
+    nvsService.open();
+    nvsService.saveOneShotBootMode(OneShotBootMode::SdrCdc);
+    nvsService.close();
+    rebootIntoAdapter(
+        "SDR Raw RF CDC",
+        "Experimental 2.2-2.8 GHz SDR",
+        "Use raw CDC at baud 115200 for scripting.",
+        "esp-sdr",
+        "Reset or press a device button to return to normal mode."
     );
 }
 
