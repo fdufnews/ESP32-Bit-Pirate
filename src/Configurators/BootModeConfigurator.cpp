@@ -1,5 +1,7 @@
 #include "Configurators/BootModeConfigurator.h"
 #include "States/GlobalState.h"
+#include "Adapters/SdrCdcAdapter.h"
+#include "Managers/BootMemoryManager.h"
 #include <algorithm>
 #include <vector>
 
@@ -212,7 +214,15 @@ bool BootModeConfigurator::configure() {
     }
     nvsService.close();
 
+    // The consumed mode must agree with the heap ownership chosen before board initialization.
+    ESP_ERROR_CHECK(BootMemoryManager::validateBootMode(mode));
+
     switch (mode) {
+        case OneShotBootMode::SdrCdc:
+            deviceView.adapterMode("ESP32-S3 SDR", "USB CDC baud 115200",
+                                   {"2.2 to 2.8 GHz", "exp 100MHz-6GHz", "2.4 GHz radio", "raw I/Q"});
+            SdrCdcAdapter::run(deviceInput, hostSerial);
+            return true;
         case OneShotBootMode::UsbUartBridge:
             showOneShotBootMode(mode, usbUartBridgeConfig, flashromSerprogConfig, busPirateAvrdudeConfig, bpio2Config, sumpLogicAnalyzerConfig, openOcdBusPirateConfig, infraredToyConfig, subGhzRawCdcConfig);
             UsbUartBridgeAdapter::run(usbUartBridgeConfig, deviceInput, hostSerial);
