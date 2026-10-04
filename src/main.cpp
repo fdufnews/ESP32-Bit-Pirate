@@ -26,6 +26,7 @@
 #include <Servers/WebSocketServer.h>
 #include <Servers/DnsServer.h>
 #include <Services/NvsService.h>
+#include <Managers/BootMemoryManager.h>
 #include <Services/UtilityService.h>
 #include <Selectors/HorizontalSelector.h>
 #include <Configurators/TerminalTypeConfigurator.h>
@@ -92,6 +93,9 @@ the main loop through the ActionDispatcher.
 */
 
 void setup() {
+    // Restore the boot mode heap before board or service initialization
+    ESP_ERROR_CHECK(BootMemoryManager::initialize());
+
     #if defined(DEVICE_STICKS3)
         StickS3Board board;
         board.initialize();
