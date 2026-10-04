@@ -38,7 +38,6 @@ private:
     static constexpr const char* apPassword = "readytoboard";
 
     // NVS
-    static constexpr const char* nvsNamespace = "wifi_settings";
     static constexpr const char* nvsSsidField = "ssid";
     static constexpr const char* nvsPasswordField = "pass";
 
@@ -499,9 +498,7 @@ public:
     size_t getFileCacheLimit() const { return fileCacheLimit; }
 
     // NVS
-    const char* getNvsNamespace() const { return nvsNamespace; }
     const char* getNvsPasswordField() const { return nvsPasswordField; }
-
     const char* getNvsSsidField() const { return nvsSsidField; }
 
     // Protected
