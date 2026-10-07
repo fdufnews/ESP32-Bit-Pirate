@@ -446,6 +446,18 @@ void test_sniff_uses_current_pins_then_reconfigures_service() {
     TEST_ASSERT_TRUE(fixture.view.contains("I2C Sniffer: Stopped"));
 }
 
+void test_sniff_applies_address_filter_then_clears_it() {
+    I2cControllerFixture fixture;
+
+    fixture.controller.handleCommand(TerminalCommand("sniff", "0x53"));
+
+    TEST_ASSERT_EQUAL_UINT32(2, fakeI2cSnifferFilterCalls);
+    TEST_ASSERT_EQUAL_HEX8(0x53, fakeI2cSnifferLastEnabledAddress);
+    TEST_ASSERT_FALSE(fakeI2cSnifferFilterEnabled);
+    TEST_ASSERT_EQUAL_HEX8(0x00, fakeI2cSnifferFilterAddress);
+    TEST_ASSERT_TRUE(fixture.view.contains("Listening for address 0x53"));
+}
+
 void test_release_frees_sniffer_and_forces_next_configuration_prompt() {
     I2cControllerFixture fixture;
     fixture.configureOnce();
@@ -514,6 +526,7 @@ void runI2cControllerTests() {
     RUN_TEST(test_eeprom_delegates_valid_address_and_restores_i2c_config);
     RUN_TEST(test_eeprom_rejects_reserved_or_overflowing_address);
     RUN_TEST(test_sniff_uses_current_pins_then_reconfigures_service);
+    RUN_TEST(test_sniff_applies_address_filter_then_clears_it);
     RUN_TEST(test_release_frees_sniffer_and_forces_next_configuration_prompt);
     RUN_TEST(test_identify_uses_known_address_database);
     RUN_TEST(test_unknown_command_displays_i2c_help);
