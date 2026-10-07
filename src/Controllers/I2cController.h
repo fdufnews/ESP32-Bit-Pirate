@@ -77,7 +77,7 @@ private:
     void handleScan();
 
     // Start sniffing I2C traffic passively
-    void handleSniff();
+    void handleSniff(const TerminalCommand& cmd);
 
     // Read data from an I2C device
     void handleRead(const TerminalCommand& cmd);

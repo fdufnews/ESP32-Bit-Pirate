@@ -32,7 +32,7 @@ Entry point to handle I2C command
 void I2cController::handleCommand(const TerminalCommand& cmd) {
     if (cmd.getRoot() == "scan") handleScan();
     else if (cmd.getRoot() == "discovery") handleDiscover();
-    else if (cmd.getRoot() == "sniff") handleSniff();
+    else if (cmd.getRoot() == "sniff") handleSniff(cmd);
     else if (cmd.getRoot() == "ping") handlePing(cmd);
     else if (cmd.getRoot() == "identify") handleIdentify(cmd);
     else if (cmd.getRoot() == "write") handleWrite(cmd);
@@ -97,36 +97,74 @@ void I2cController::handleScan() {
 /*
 Sniff
 */    
-void I2cController::handleSniff() {
-    terminalView.println("I2C Sniffer: Listening on SCL/SDA... Press [ENTER] to stop.\n");
+void I2cController::handleSniff(const TerminalCommand& cmd) {
+    if (!cmd.getArgs().empty()) {
+        terminalView.println("Usage: sniff [addr]");
+        return;
+    }
+
+    bool filterEnabled = false;
+    uint8_t filterAddress = 0;
+
+    if (!cmd.getSubcommand().empty()) {
+        if (!tryParseAddress(cmd.getSubcommand(), filterAddress)) {
+            terminalView.println("I2C Sniffer: Invalid address. Use decimal or 0x-prefixed hex (0x00-0x7F).");
+            return;
+        }
+        filterEnabled = true;
+    }
+
+    if (filterEnabled) {
+        terminalView.println("I2C Sniffer: Listening for address 0x" +
+                             argTransformer.toHex(filterAddress) +
+                             " on SCL/SDA... Press [ENTER] to stop.\n");
+    } else {
+        terminalView.println("I2C Sniffer: Listening on SCL/SDA... Press [ENTER] to stop.\n");
+    }
+
+    i2c_sniffer_set_address_filter(filterEnabled, filterAddress);
     i2c_sniffer_begin(state.getI2cSclPin(), state.getI2cSdaPin()); // dont need freq to work
     if (!i2c_sniffer_setup()) {
-        terminalView.println("I2C Sniffer: Not enough memory to allocate buffers.");
+        // setup() may already have allocated some lazy buffers before a later
+        // MCPWM allocation fails. Release everything immediately so a failed
+        // sniff attempt never leaves heap reserved.
+        i2c_sniffer_release();
+        i2c_sniffer_set_address_filter(false, 0);
+        i2cService.configure(state.getI2cSdaPin(), state.getI2cSclPin(), state.getI2cFrequency());
+        terminalView.println("I2C Sniffer: Failed to allocate capture buffers or MCPWM capture hardware.");
         return;
     }
 
     std::string line;
+    line.reserve(256);
 
     while (true) {
         char key = terminalInput.readChar();
         if (key == '\r' || key == '\n') break;
 
-        while (i2c_sniffer_available()) {
+        // Keep capture/output draining fast, but periodically return to the
+        // input poll so ENTER can still stop a continuously busy I2C bus.
+        size_t charsThisPass = 0;
+        static constexpr size_t MAX_CHARS_PER_PASS = 512;
+        while (charsThisPass < MAX_CHARS_PER_PASS && i2c_sniffer_available()) {
             char c = i2c_sniffer_read();
+            charsThisPass++;
 
             if (c == '\n') {
                 line += "  ";
                 terminalView.println(line);
                 line.clear();
-            } else {
+            } else if (c != '\0') {
                 line += c;
             }
         }
-        utilityService.sleepUs(100);
     }
 
-    i2c_sniffer_reset_buffer();
+    // Stop capture hardware but keep the lazy sniffer buffers allocated while
+    // we remain in I2C mode. They are reused by the next sniff command and are
+    // released by ensureReleased() when leaving I2C mode.
     i2c_sniffer_stop();
+    i2c_sniffer_set_address_filter(false, 0);
     i2cService.configure(state.getI2cSdaPin(), state.getI2cSclPin(), state.getI2cFrequency());
     terminalView.println("\n\nI2C Sniffer: Stopped.");
 }

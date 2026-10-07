@@ -181,7 +181,7 @@ void HelpShell::cmdI2c() {
         "discovery            - Report on devices",
         "ping <addr>          - Check ACK",
         "identify <addr>      - Identify device",
-        "sniff                - View traffic",
+        "sniff [addr]         - View/filter traffic",
         "slave <addr>         - Emulate I2C device",
         "read <addr> [reg]    - Read register",
         "write <a> [r] [val]  - Write register",
