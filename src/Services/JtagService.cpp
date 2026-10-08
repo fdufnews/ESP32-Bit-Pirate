@@ -38,6 +38,12 @@
 #include "esp_timer.h"
 
 #define JTAG_DELAY_US 1
+#define JTAG_SCAN_SETTLE_US 5
+
+// Set to 1 in build_flags (-DJTAG_SCAN_DEBUG=1) to trace rejected permutations.
+#ifndef JTAG_SCAN_DEBUG
+#define JTAG_SCAN_DEBUG 0
+#endif
 #define SWD_DELAY_US 5
 #define LINE_RESET_CLK_CYCLES 52
 #define JTAG_TO_SWD_CMD 0xE79E
@@ -58,16 +64,28 @@ void JtagService::configureJtag(uint8_t tck, uint8_t tms, uint8_t tdi, uint8_t t
     _pinTDO = tdo;
     _pinTRST = trst;
 
-    gpio_set_direction((gpio_num_t)_pinTCK, GPIO_MODE_OUTPUT);
+    // Preload output latches BEFORE enabling the drivers: changing pin roles
+    // must not introduce an unintended rising edge on the real target TCK.
     gpio_set_level((gpio_num_t)_pinTCK, 0);
+    gpio_set_level((gpio_num_t)_pinTMS, 1);
+    gpio_set_level((gpio_num_t)_pinTDI, 0);
+    if (trst >= 0) gpio_set_level((gpio_num_t)_pinTRST, 1);
+
+    // Scan initialization may have enabled pull resistors on these pins.
+    gpio_set_pull_mode((gpio_num_t)_pinTCK, GPIO_FLOATING);
+    gpio_set_pull_mode((gpio_num_t)_pinTMS, GPIO_FLOATING);
+    gpio_set_pull_mode((gpio_num_t)_pinTDI, GPIO_FLOATING);
+    gpio_set_pull_mode((gpio_num_t)_pinTDO, GPIO_FLOATING);
+
+    gpio_set_direction((gpio_num_t)_pinTDO, GPIO_MODE_INPUT);
     gpio_set_direction((gpio_num_t)_pinTMS, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)_pinTDI, GPIO_MODE_OUTPUT);
-    gpio_set_direction((gpio_num_t)_pinTDO, GPIO_MODE_INPUT);
+    gpio_set_direction((gpio_num_t)_pinTCK, GPIO_MODE_OUTPUT); // Enable TCK last.
 
     if (trst >= 0) {
         gpio_set_direction((gpio_num_t)_pinTRST, GPIO_MODE_OUTPUT);
-        gpio_set_level((gpio_num_t)_pinTRST, 1);  // deassert
     }
+    esp_rom_delay_us(JTAG_SCAN_SETTLE_US);
 }
 
 void JtagService::tckPulse() {
@@ -94,7 +112,7 @@ bool JtagService::tdoRead() {
 
 void JtagService::restoreIdle() {
     tmsWrite(true);
-    for (int i = 0; i < 5; ++i) tckPulse();
+    for (int i = 0; i < 8; ++i) tckPulse();
     tmsWrite(false);
     tckPulse(); // Enter Run-Test/Idle
 }
@@ -280,11 +298,24 @@ bool JtagService::scanJtagDevice(
                     int deviceCount = detectDevices();
 
                     if (deviceCount <= 0) {
+#if JTAG_SCAN_DEBUG
+                        Serial.printf("[JTAG scan] TDI=%u TDO=%u TCK=%u TMS=%u: device count=%d\n",
+                                      tdi, tdo, tck, tms, deviceCount);
+#endif
                         continue;
                     }
+#if JTAG_SCAN_DEBUG
+                    Serial.printf("[JTAG scan] TDI=%u TDO=%u TCK=%u TMS=%u: device count=%d\n",
+                                  tdi, tdo, tck, tms, deviceCount);
+#endif
 
                     uint32_t dataIn = esp_random();
                     uint32_t dataOut = bypassTest(deviceCount, dataIn);
+#if JTAG_SCAN_DEBUG
+                    Serial.printf("[JTAG scan] BYPASS in=0x%08lx out=0x%08lx %s\n",
+                                  (unsigned long)dataIn, (unsigned long)dataOut,
+                                  dataIn == dataOut ? "PASS" : "FAIL");
+#endif
 
                     if (dataIn == dataOut) {
                         std::vector<uint32_t> ids;
@@ -296,6 +327,11 @@ bool JtagService::scanJtagDevice(
                             continue;
                         }
 
+#if JTAG_SCAN_DEBUG
+                        Serial.printf("[JTAG scan] IDCODE raw=0x%08lx %s\n",
+                                      (unsigned long)tempDeviceId,
+                                      isValidDeviceID(tempDeviceId) ? "PASS" : "FAIL");
+#endif
                         if (!isValidDeviceID(tempDeviceId)) {
                             continue;
                         }
