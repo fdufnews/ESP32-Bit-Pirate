@@ -17,11 +17,7 @@ and injecting shared instances of core components
 #include "Services/I2cService.h"
 #include "Services/OneWireService.h"
 #include "Services/TwoWireService.h"
-#ifdef DEVICE_STICKS3
-#include "Services/M5StickS3InfraredService.h"
-#else
 #include "Services/InfraredService.h"
-#endif
 #include "Services/UsbS3Service.h"
 #include "Services/HdUartService.h"
 #include "Services/SpiService.h"
@@ -273,11 +269,7 @@ private:
     OneWireService oneWireService;
     TwoWireService twoWireService;
     ThreeWireService threeWireService;
-#ifdef DEVICE_STICKS3
-    M5StickS3InfraredService infraredService;
-#else
     InfraredService infraredService;
-#endif
     HdUartService hdUartService;
     SpiService spiService;
     PinService pinService;
