@@ -94,7 +94,10 @@ void SubGhzController::handleScan(const TerminalCommand& cmd) {
     // Ask to save best frequency if above threshold
     if (!idx.empty() && best[idx[0]] > -120) {
         auto confirm = userInputManager.readYesNo(" Save tuning to best frequency (" + argTransformer.toFixed2(freqs[idx[0]]) + " MHz)?", true);
-        if (!confirm) return;
+        if (!confirm) {
+            subGhzService.tune(state.getSubGhzFrequency());
+            return;
+        }
         subGhzService.tune(freqs[idx[0]]);
         terminalView.println(" [FREQ] Saving to config: " + argTransformer.toFixed2(freqs[idx[0]]) + " MHz\n");
         state.setSubGhzFrequency(freqs[idx[0]]);
