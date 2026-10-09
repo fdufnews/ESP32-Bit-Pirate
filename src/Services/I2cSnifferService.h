@@ -20,6 +20,9 @@ public:
     bool available() override;
     char read() override;
     void resetBuffer() override;
+    bool measureFrequency(uint8_t scl, uint32_t timeoutMs,
+                          I2cFrequencyResult& result,
+                          const std::function<bool()>& shouldStop) override;
 
 private:
     uint8_t sniffer_scl_pin = 1;

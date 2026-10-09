@@ -460,6 +460,68 @@ void test_sniff_applies_address_filter_then_clears_it() {
     TEST_ASSERT_TRUE(fixture.view.contains("Listening for address 0x53"));
 }
 
+void test_frequency_waits_without_timeout_and_restores_bus_without_changing_speed() {
+    I2cControllerFixture fixture;
+    fixture.snifferService.frequencyResult = {true, 30, 27, 400000, 2.5, 1.5, 1.0};
+    fixture.snifferService.onFrequencyMeasure = [&fixture]() {
+        TEST_ASSERT_EQUAL_UINT32(1, fixture.i2cService.endCalls);
+        TEST_ASSERT_TRUE(fixture.i2cService.configurations.empty());
+    };
+
+    fixture.controller.handleCommand(TerminalCommand("freq"));
+
+    TEST_ASSERT_EQUAL_UINT32(1, fixture.snifferService.frequencyCalls);
+    TEST_ASSERT_EQUAL_UINT8(1, fixture.snifferService.frequencyScl);
+    TEST_ASSERT_EQUAL_UINT32(0, fixture.snifferService.frequencyTimeoutMs);
+    TEST_ASSERT_EQUAL_UINT32(1, fixture.i2cService.configurations.size());
+    TEST_ASSERT_EQUAL_UINT8(2, fixture.i2cService.configurations[0].sda);
+    TEST_ASSERT_EQUAL_UINT8(1, fixture.i2cService.configurations[0].scl);
+    TEST_ASSERT_EQUAL_UINT32(100000, fixture.i2cService.configurations[0].frequency);
+    TEST_ASSERT_EQUAL_UINT32(100000, GlobalState::getInstance().getI2cFrequency());
+    TEST_ASSERT_TRUE(fixture.i2cService.beginAddresses.empty());
+    TEST_ASSERT_TRUE(fixture.view.contains("SCL: GPIO 1"));
+    TEST_ASSERT_TRUE(fixture.view.contains("Listening... ENTER to stop."));
+    TEST_ASSERT_TRUE(fixture.view.contains("Freq: 400.00 kHz"));
+    TEST_ASSERT_TRUE(fixture.view.contains("LOW: 1.50 us"));
+    TEST_ASSERT_TRUE(fixture.view.contains("HIGH: 1.00 us"));
+    TEST_ASSERT_TRUE(fixture.view.contains("Cycles: 27/30"));
+}
+
+void test_frequency_reports_unreliable_capture() {
+    I2cControllerFixture fixture;
+    fixture.controller.handleCommand(TerminalCommand("freq"));
+    TEST_ASSERT_TRUE(fixture.view.contains("Freq: No stable clock."));
+    TEST_ASSERT_FALSE(fixture.view.contains("kHz"));
+    TEST_ASSERT_EQUAL_UINT32(1, fixture.i2cService.configurations.size());
+}
+
+void test_frequency_rejects_arguments_without_touching_bus() {
+    I2cControllerFixture fixture;
+    for (const char* argument : {"1000", "10000", "0", "invalid"}) {
+        fixture.controller.handleCommand(TerminalCommand("freq", argument));
+    }
+    fixture.controller.handleCommand(TerminalCommand("freq", "1000", "extra"));
+    fixture.controller.handleCommand(TerminalCommand("freq", "", "extra"));
+    TEST_ASSERT_EQUAL_UINT32(0, fixture.snifferService.frequencyCalls);
+    TEST_ASSERT_EQUAL_UINT32(0, fixture.i2cService.endCalls);
+    TEST_ASSERT_TRUE(fixture.i2cService.configurations.empty());
+    TEST_ASSERT_TRUE(fixture.view.contains("Usage: freq"));
+}
+
+void test_frequency_failure_and_enter_cancellation_restore_bus() {
+    for (bool fail : {true, false}) {
+        I2cControllerFixture fixture;
+        fixture.snifferService.frequencySuccess = !fail;
+        fixture.snifferService.pollFrequencyCancellation = !fail;
+        fixture.input.queueReadChar('\n');
+        fixture.controller.handleCommand(TerminalCommand("freq"));
+        TEST_ASSERT_EQUAL_UINT32(1, fixture.i2cService.configurations.size());
+        TEST_ASSERT_TRUE(fixture.view.contains(fail ? "Freq error:" : "Freq: Stopped."));
+        TEST_ASSERT_EQUAL(!fail, fixture.snifferService.frequencyCancelled);
+        TEST_ASSERT_FALSE(fixture.view.contains("kHz"));
+    }
+}
+
 void test_release_frees_sniffer_and_forces_next_configuration_prompt() {
     I2cControllerFixture fixture;
     fixture.configureOnce();
@@ -529,6 +591,10 @@ void runI2cControllerTests() {
     RUN_TEST(test_eeprom_rejects_reserved_or_overflowing_address);
     RUN_TEST(test_sniff_uses_current_pins_then_reconfigures_service);
     RUN_TEST(test_sniff_applies_address_filter_then_clears_it);
+    RUN_TEST(test_frequency_waits_without_timeout_and_restores_bus_without_changing_speed);
+    RUN_TEST(test_frequency_reports_unreliable_capture);
+    RUN_TEST(test_frequency_rejects_arguments_without_touching_bus);
+    RUN_TEST(test_frequency_failure_and_enter_cancellation_restore_bus);
     RUN_TEST(test_release_frees_sniffer_and_forces_next_configuration_prompt);
     RUN_TEST(test_identify_uses_known_address_database);
     RUN_TEST(test_unknown_command_displays_i2c_help);

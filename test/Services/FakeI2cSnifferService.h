@@ -14,6 +14,25 @@ inline uint8_t fakeI2cSnifferLastEnabledAddress = 0;
 
 class FakeI2cSnifferService final : public II2cSnifferService {
 public:
+    uint32_t frequencyCalls = 0;
+    uint8_t frequencyScl = 0;
+    uint32_t frequencyTimeoutMs = 0;
+    bool frequencySuccess = true;
+    bool pollFrequencyCancellation = false;
+    bool frequencyCancelled = false;
+    I2cFrequencyResult frequencyResult;
+    std::function<void()> onFrequencyMeasure;
+
+    bool measureFrequency(uint8_t scl, uint32_t timeoutMs, I2cFrequencyResult& result,
+                          const std::function<bool()>& shouldStop) override {
+        ++frequencyCalls;
+        frequencyScl = scl;
+        frequencyTimeoutMs = timeoutMs;
+        if (onFrequencyMeasure) onFrequencyMeasure();
+        if (pollFrequencyCancellation) frequencyCancelled = shouldStop();
+        result = frequencyResult;
+        return frequencySuccess;
+    }
     void begin(uint8_t scl, uint8_t sda) override {
         ++fakeI2cSnifferBeginCalls;
         fakeI2cSnifferScl = scl;

@@ -35,6 +35,7 @@ void I2cController::handleCommand(const TerminalCommand& cmd) {
     if (cmd.getRoot() == "scan") handleScan();
     else if (cmd.getRoot() == "discovery") handleDiscover();
     else if (cmd.getRoot() == "sniff") handleSniff(cmd);
+    else if (cmd.getRoot() == "freq") handleFrequency();
     else if (cmd.getRoot() == "ping") handlePing(cmd);
     else if (cmd.getRoot() == "identify") handleIdentify(cmd);
     else if (cmd.getRoot() == "write") handleWrite(cmd);
@@ -168,6 +169,53 @@ void I2cController::handleSniff(const TerminalCommand& cmd) {
     i2cSnifferService.setAddressFilter(false, 0);
     i2cService.configure(state.getI2cSdaPin(), state.getI2cSclPin(), state.getI2cFrequency());
     terminalView.println("\n\nI2C Sniffer: Stopped.");
+}
+
+void I2cController::handleFrequency() {
+    terminalView.println("I2C Freq: Listening on SCL to estimate frequency.... Press [ENTER] to stop.");
+
+    i2cService.end();
+    I2cFrequencyResult result;
+    bool cancelled = false;
+    const bool success = i2cSnifferService.measureFrequency(
+        state.getI2cSclPin(), 0, result, [this, &cancelled]() {
+            const char key = terminalInput.readChar();
+            cancelled = key == '\r' || key == '\n';
+            return cancelled;
+        });
+    i2cService.configure(state.getI2cSdaPin(), state.getI2cSclPin(), state.getI2cFrequency());
+
+    if (!success) {
+        terminalView.println(std::string("Freq error: ") + i2cSnifferService.lastError());
+        return;
+    }
+    if (cancelled) {
+        terminalView.println("I2C Freq: Stopped by user.\n");
+        return;
+    }
+    if (!result.reliable) {
+        terminalView.println("I2C Freq: No stable clock.\n");
+        return;
+    }
+
+    terminalView.println("\n=== Frequency Report ===");
+
+    std::ostringstream report;
+    report << std::fixed << std::setprecision(2)
+           << "Freq: " << result.frequencyHz / 1000.0 << " kHz\n\r"
+           << "Period: " << result.periodUs << " us\n\r"
+           << "LOW: " << result.lowUs << " us\n\r"
+           << "HIGH: " << result.highUs << " us\n\r"
+           << "Cycles: " << result.acceptedCycles << "/" << result.capturedCycles;
+    terminalView.println(report.str());
+    terminalView.println("========================\n");
+
+    auto confirm = userInputManager.readYesNo("Save frequency to the configuration?", false);
+    if (confirm) {
+        state.setI2cFrequency(result.frequencyHz);
+        terminalView.println("Frequency saved to configuration.");
+    }
+    terminalView.println("");
 }
 
 /*

@@ -1,5 +1,16 @@
 #pragma once
 #include <cstdint>
+#include <functional>
+
+struct I2cFrequencyResult {
+    bool reliable = false;
+    uint32_t capturedCycles = 0;
+    uint32_t acceptedCycles = 0;
+    double frequencyHz = 0;
+    double periodUs = 0;
+    double lowUs = 0;
+    double highUs = 0;
+};
 
 class II2cSnifferService {
 public:
@@ -16,4 +27,7 @@ public:
     virtual bool available() = 0;
     virtual char read() = 0;
     virtual void resetBuffer() = 0;
+    virtual bool measureFrequency(uint8_t scl, uint32_t timeoutMs,
+                                  I2cFrequencyResult& result,
+                                  const std::function<bool()>& shouldStop) = 0;
 };

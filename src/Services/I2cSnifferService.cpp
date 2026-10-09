@@ -1,4 +1,5 @@
 #include "I2cSnifferService.h"
+#include "Analyzers/I2cFrequencyAnalyzer.h"
 #include <Arduino.h>
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
@@ -12,10 +13,68 @@
 #include <climits>
 #include <cstdlib>
 #include <new>
-
+#include <memory>
 #endif
 
 namespace {
+#if SOC_RMT_SUPPORT_DMA
+// Passive SCL frequency capture.
+constexpr uint32_t frequencyResolutionHz = 20000000; // 50 ns
+constexpr size_t frequencyDmaSymbols = 512;
+constexpr size_t frequencySampleSymbols = 1024;
+
+struct FrequencyCapture {
+    rmt_channel_handle_t channel = nullptr;
+    rmt_symbol_word_t* dma = nullptr;
+    rmt_symbol_word_t* samples = nullptr;
+    rmt_receive_config_t receiveConfig = {};
+    size_t count = 0;
+    esp_err_t receiveError = ESP_OK;
+    bool running = false;
+    bool enabled = false;
+
+    void stop() {
+        __atomic_store_n(&running, false, __ATOMIC_RELEASE);
+        // Disable before reading/freeing storage shared with the RX ISR.
+        if (enabled) rmt_disable(channel);
+        enabled = false;
+    }
+
+    ~FrequencyCapture() {
+        stop();
+        if (channel) rmt_del_channel(channel);
+        heap_caps_free(dma);
+        heap_caps_free(samples);
+    }
+};
+
+bool IRAM_ATTR onFrequencyReceived(rmt_channel_handle_t channel,
+                                   const rmt_rx_done_event_data_t* event,
+                                   void* context) {
+    auto& capture = *static_cast<FrequencyCapture*>(context);
+    if (!__atomic_load_n(&capture.running, __ATOMIC_ACQUIRE)) return false;
+
+    size_t count = __atomic_load_n(&capture.count, __ATOMIC_RELAXED);
+    // Partial RX memory belongs to the driver and may be reused immediately.
+    // Copy and publish a bounded sample here; analyze it in task context.
+    for (size_t i = 0; i < event->num_symbols && count < frequencySampleSymbols; ++i) {
+        capture.samples[count++] = event->received_symbols[i];
+    }
+    if (event->flags.is_last && count < frequencySampleSymbols) {
+        capture.samples[count++].val = 0; // explicit burst boundary
+    }
+    __atomic_store_n(&capture.count, count, __ATOMIC_RELEASE);
+
+    if (event->flags.is_last && count < frequencySampleSymbols &&
+        __atomic_load_n(&capture.running, __ATOMIC_ACQUIRE)) {
+        const esp_err_t error = rmt_receive(channel, capture.dma,
+            frequencyDmaSymbols * sizeof(rmt_symbol_word_t), &capture.receiveConfig);
+        __atomic_store_n(&capture.receiveError, error, __ATOMIC_RELEASE);
+    }
+    return false;
+}
+#endif
+
 namespace I2cRmtCapture {
 struct Edge {
     uint32_t ticks; // 10 MHz software timestamp, wraps
@@ -1143,4 +1202,115 @@ char I2cSnifferService::read() {
 void I2cSnifferService::resetBuffer() {
     if (!charRing || !eventRing) return;
     reset_buffers_and_decoder();
+}
+
+bool I2cSnifferService::measureFrequency(uint8_t scl, uint32_t timeoutMs,
+                                        I2cFrequencyResult& result,
+                                        const std::function<bool()>& shouldStop) {
+    result = {};
+    // A previous sniff retains its RMT channels. Release them before claiming
+    // the single DMA RX channel, and leave frequency capture entirely lazy.
+    release();
+    snifferSetupError = "none";
+#if SOC_RMT_SUPPORT_DMA
+    if (!GPIO_IS_VALID_GPIO(scl)) {
+        snifferSetupError = "invalid SCL GPIO";
+        return false;
+    }
+
+    // Callback state must stay in internal SRAM, even on PSRAM boards.
+    auto destroyCapture = [](FrequencyCapture* state) {
+        if (!state) return;
+        state->~FrequencyCapture();
+        heap_caps_free(state);
+    };
+    void* storage = heap_caps_malloc(sizeof(FrequencyCapture), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    std::unique_ptr<FrequencyCapture, decltype(destroyCapture)> capture(
+        storage ? new (storage) FrequencyCapture{} : nullptr, destroyCapture);
+    if (!capture) {
+        snifferSetupError = "failed to allocate frequency capture state";
+        return false;
+    }
+    capture->dma = static_cast<rmt_symbol_word_t*>(heap_caps_malloc(
+        frequencyDmaSymbols * sizeof(rmt_symbol_word_t),
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA));
+    capture->samples = static_cast<rmt_symbol_word_t*>(heap_caps_malloc(
+        frequencySampleSymbols * sizeof(rmt_symbol_word_t),
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!capture->dma || !capture->samples) {
+        snifferSetupError = "failed to allocate frequency capture buffers";
+        return false;
+    }
+
+    // Wire must already be released by the caller. The observed bus supplies
+    // its own pull-ups; this command never drives SCL or generates traffic.
+    pinMode(scl, INPUT);
+    rmt_rx_channel_config_t config = {};
+    config.gpio_num = static_cast<gpio_num_t>(scl);
+    config.clk_src = RMT_CLK_SRC_DEFAULT;
+    config.resolution_hz = frequencyResolutionHz;
+    config.mem_block_symbols = frequencyDmaSymbols;
+    config.flags.with_dma = true;
+
+    auto check = [this](esp_err_t error) {
+        if (error == ESP_OK) return true;
+        snifferSetupError = esp_err_to_name(error);
+        return false;
+    };
+    if (!check(rmt_new_rx_channel(&config, &capture->channel))) return false;
+    rmt_rx_event_callbacks_t callbacks = {};
+    callbacks.on_recv_done = onFrequencyReceived;
+    if (!check(rmt_rx_register_event_callbacks(capture->channel, &callbacks, capture.get()))) return false;
+    if (!check(rmt_enable(capture->channel))) return false;
+    capture->enabled = true;
+    capture->receiveConfig.signal_range_min_ns = 100;
+    capture->receiveConfig.signal_range_max_ns = 1000000; // 1 ms idle, fits 15-bit ticks
+    capture->receiveConfig.flags.en_partial_rx = true;
+    __atomic_store_n(&capture->running, true, __ATOMIC_RELEASE);
+    if (!check(rmt_receive(capture->channel, capture->dma,
+            frequencyDmaSymbols * sizeof(rmt_symbol_word_t), &capture->receiveConfig))) return false;
+
+    const uint32_t started = millis();
+    I2cFrequencyAnalyzer analyzer;
+    size_t processed = 0;
+    while (timeoutMs == 0 || static_cast<uint32_t>(millis() - started) < timeoutMs) {
+        if (shouldStop && shouldStop()) break;
+        if (__atomic_load_n(&capture->receiveError, __ATOMIC_ACQUIRE) != ESP_OK) break;
+
+        // Published samples are immutable; the ISR only appends after this
+        // prefix. Keep collecting sparse bursts until enough clocks agree.
+        const size_t count = __atomic_load_n(&capture->count, __ATOMIC_ACQUIRE);
+        if (count != processed) {
+            for (; processed < count; ++processed) {
+                const auto& symbol = capture->samples[processed];
+                analyzer.addPulse(symbol.duration0, symbol.level0 != 0);
+                if (symbol.duration0 != 0) analyzer.addPulse(symbol.duration1, symbol.level1 != 0);
+            }
+            result = analyzer.result(frequencyResolutionHz);
+            if (result.reliable) break;
+        }
+
+        if (count == frequencySampleSymbols) {
+            // Noise or changing clocks filled this bounded window. Start a
+            // fresh window so an earlier bad capture cannot poison detection.
+            capture->stop();
+            analyzer = I2cFrequencyAnalyzer{};
+            processed = 0;
+            __atomic_store_n(&capture->count, 0u, __ATOMIC_RELEASE);
+            if (!check(rmt_enable(capture->channel))) return false;
+            capture->enabled = true;
+            __atomic_store_n(&capture->running, true, __ATOMIC_RELEASE);
+            if (!check(rmt_receive(capture->channel, capture->dma,
+                    frequencyDmaSymbols * sizeof(rmt_symbol_word_t), &capture->receiveConfig))) return false;
+        }
+        delay(1);
+    }
+    capture->stop();
+    if (!check(__atomic_load_n(&capture->receiveError, __ATOMIC_ACQUIRE))) return false;
+
+    return true;
+#else
+    snifferSetupError = "SCL frequency capture requires RMT RX DMA support";
+    return false;
+#endif
 }

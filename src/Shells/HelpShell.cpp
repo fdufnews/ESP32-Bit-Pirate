@@ -182,6 +182,7 @@ void HelpShell::cmdI2c() {
         "ping <addr>          - Check ACK",
         "identify <addr>      - Identify device",
         "sniff [addr]         - View/filter traffic",
+        "freq                 - Measure SCL clock",
         "slave <addr>         - Emulate I2C device",
         "read <addr> [reg]    - Read register",
         "write <a> [r] [val]  - Write register",

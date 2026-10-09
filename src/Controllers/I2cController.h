@@ -81,6 +81,9 @@ private:
     // Start sniffing I2C traffic passively
     void handleSniff(const TerminalCommand& cmd);
 
+    // Estimate external bus frequency from passive SCL observations
+    void handleFrequency();
+
     // Read data from an I2C device
     void handleRead(const TerminalCommand& cmd);
 

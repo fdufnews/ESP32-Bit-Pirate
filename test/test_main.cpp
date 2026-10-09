@@ -18,6 +18,7 @@
 #include "../src/Transformers/WebRequestTransformer.cpp"
 #include "../src/Analyzers/BinaryAnalyzer.cpp"
 #include "../src/Analyzers/PinAnalyzer.cpp"
+#include "../src/Analyzers/I2cFrequencyAnalyzer.cpp"
 #include "../src/Analyzers/SubGhzAnalyzer.cpp"
 #include "../src/Managers/AliasManager.cpp"
 #include "../src/Managers/CommandHistoryManager.cpp"
@@ -77,6 +78,7 @@
 #include "Enums/test_InfraredProtocolEnum.cpp"
 #include "Analyzers/test_BinaryAnalyzer.cpp"
 #include "Analyzers/test_PinAnalyzer.cpp"
+#include "Analyzers/test_I2cFrequencyAnalyzer.cpp"
 #include "Analyzers/test_SubGhzAnalyzer.cpp"
 #include "Selectors/test_HorizontalSelector.cpp"
 #include "Managers/test_AliasManager.cpp"
@@ -141,6 +143,7 @@ int main(int, char**) {
     runInfraredProtocolEnumTests();
     runBinaryAnalyzerTests();
     runPinAnalyzerTests();
+    runI2cFrequencyAnalyzerTests();
     runSubGhzAnalyzerTests();
     runHorizontalSelectorTests();
     runAliasManagerTests();
