@@ -1,0 +1,1146 @@
+#include "I2cSnifferService.h"
+#include <Arduino.h>
+#include "driver/gpio.h"
+#include "esp_heap_caps.h"
+#include "soc/soc_caps.h"
+#if SOC_RMT_SUPPORT_DMA
+#include "driver/rmt_rx.h"
+#include "esp_err.h"
+#include "esp_attr.h"
+#include "esp_timer.h"
+#include <cstdio>
+#include <climits>
+#include <cstdlib>
+#include <new>
+
+#endif
+
+namespace {
+namespace I2cRmtCapture {
+struct Edge {
+    uint32_t ticks; // 10 MHz software timestamp, wraps
+    bool rising;
+};
+bool prepare();
+bool begin(uint8_t sclGpio, uint8_t sdaGpio);
+void stop();
+void poll();
+bool next(Edge& edge, bool& isSda);
+bool takeOverflow();
+bool takeAlignmentFailure();
+bool drained();
+const char* lastError();
+void release();
+} // namespace I2cRmtCapture
+
+#if SOC_RMT_SUPPORT_DMA
+namespace I2cRmtCapture {
+static constexpr uint32_t kHz = 10000000; // 100 ns ticks, <=3.276 ms idle
+static constexpr uint32_t kIdleNs = 2000000; // 2 ms ends a burst
+static constexpr size_t kRxSymbols = 512;
+static constexpr size_t kSdaMemSymbols = 2 * SOC_RMT_MEM_WORDS_PER_CHANNEL;
+static constexpr uint16_t kRingSize = 4096; // 16 KiB/line for packed edges
+static constexpr uint16_t kRingMask = kRingSize - 1;
+static constexpr uint32_t kTickMask = 0x7FFFFFFFUL;
+static volatile uint32_t acknowledgedErrors = 0;
+static constexpr uint32_t kGuardTicks = 25; // hold 2.5 us after both watermarks
+// ISR only queues burst-completion metadata. Retiming thousands of edges in
+// the ISR blocked the next receive for up to ~260us in real scan traces.
+static constexpr uint8_t kCompletionSlots = 8;
+static constexpr uint8_t kCompletionMask = kCompletionSlots - 1;
+struct Completion {
+    uint16_t start;
+    uint16_t end;
+    uint32_t epoch;
+    uint32_t progress;
+};
+
+struct Channel {
+    rmt_channel_handle_t handle = nullptr;
+    gpio_num_t pin = GPIO_NUM_NC;
+    rmt_symbol_word_t* symbols = nullptr;
+    uint32_t* edges = nullptr; // timestamp in 31 bits, high bit = rising
+    volatile uint16_t write = 0;
+    volatile uint16_t read = 0;
+    volatile uint16_t readyWrite = 0; // published only after end-of-burst epoch calibration
+    uint16_t burstStart = 0;
+    Completion completions[kCompletionSlots] = {};
+    volatile uint8_t completionW = 0; // ISR producer
+    volatile uint8_t completionR = 0; // task consumer
+    volatile uint32_t progress = 0;
+    volatile bool haveProgress = false;
+    volatile bool overflow = false;
+    volatile bool receiving = false;
+    volatile bool enabled = false;
+    volatile esp_err_t rxError = ESP_OK;
+    uint32_t elapsedTicks = 0;
+    uint8_t currentLevel = 1;
+    bool levelKnown = false;
+    bool started = false;
+    volatile uint32_t completed = 0;
+};
+// Allocate the sizable capture state only on first sniff.
+// No Channel instances or calibration arrays are retained in .bss at boot.
+struct CalEdge { int32_t tick; bool rise; };
+struct CaptureMemory {
+    Channel clock;
+    Channel dataPin;
+    CalEdge clocks[256];
+    CalEdge data[192];
+    char failure[160] = "not initialized";
+};
+static CaptureMemory* captureMemory = nullptr;
+// Indirection avoids reserving large channel/calibration structures at boot.
+static inline Channel& scl() { return captureMemory->clock; }
+static inline Channel& sda() { return captureMemory->dataPin; }
+static volatile bool running = false;
+static volatile uint32_t errors = 0;
+static volatile uint32_t overflows = 0;
+static rmt_receive_config_t rxConfig = {};
+static const char* earlyFailure = "not initialized";
+static inline char* failureBuffer() { return captureMemory->failure; }
+static int32_t sdaSkewTicks = 0;
+static uint32_t calibratedSclCompleted = 0;
+static uint32_t calibratedSdaCompleted = 0;
+static uint32_t calibrationCount = 0;
+static volatile uint32_t alignmentFailures = 0;
+static uint32_t reportedAlignmentFailures = 0;
+// Never feed unrelated, callback-derived clocks into the protocol decoder.
+// A successful alignment must be established for every RX burst pair.
+static bool alignmentValid = false;
+
+// Called from single-producer per-channel RMT RX ISR, consumed from task.
+static inline void IRAM_ATTR emit(Channel& c, uint32_t time, bool rise) {
+    const uint16_t w = c.write;
+    const uint16_t n = (uint16_t)((w + 1u) & kRingMask);
+    if (n == __atomic_load_n(&c.read, __ATOMIC_ACQUIRE)) {
+        c.overflow = true;
+        ++overflows;
+        return;
+    }
+    // Store RELATIVE ticks. These are not comparable to the other RMT
+    // channel until the burst finishes and an absolute epoch is estimated.
+    c.edges[w] = (time & 0x7FFFFFFFUL) | (rise ? 0x80000000UL : 0);
+    __atomic_store_n(&c.write, n, __ATOMIC_RELEASE);
+}
+static inline void IRAM_ATTR pulse(Channel& c, uint32_t duration, uint8_t level) {
+    // RMT symbols contain two level/duration intervals. The very first
+    // level establishes the initial state; every subsequent change is an edge.
+    if (duration == 0) return;
+    const uint32_t ts = c.elapsedTicks;
+    if (!c.levelKnown) {
+        // ESP32-S3 RMT begins at the FIRST input transition. This first
+        // interval is itself a real edge (typically SDA START or SCL fall),
+        // not an initial idle level to discard.
+        c.currentLevel = level;
+        c.levelKnown = true;
+        emit(c, ts, level != 0);
+    } else if (level != c.currentLevel) {
+        c.currentLevel = level;
+        emit(c, ts, level != 0);
+    }
+    c.elapsedTicks += duration;
+}
+static bool IRAM_ATTR arm(Channel& c) {
+    // ESP32-S3 RMT starts counting on the FIRST received edge, not when
+    // rmt_receive is called. Do not timestamp this burst at arm time.
+    c.burstStart = c.write;
+    c.elapsedTicks = 0;
+    c.levelKnown = false;
+    c.started = true;
+    const esp_err_t e = rmt_receive(c.handle, c.symbols,
+                                   kRxSymbols * sizeof(rmt_symbol_word_t), &rxConfig);
+    c.rxError = e;
+    c.receiving = (e == ESP_OK);
+    if (e != ESP_OK) ++errors;
+    return e == ESP_OK;
+}
+static bool IRAM_ATTR onDone(rmt_channel_handle_t, const rmt_rx_done_event_data_t* data, void* ctx) {
+    auto* c = static_cast<Channel*>(ctx);
+    if (!running) return false;
+    // Read wall clock BEFORE copying potentially hundreds of symbols in ISR.
+    const uint32_t callbackUs = (uint32_t)esp_timer_get_time();
+    // Copy/decode immediately: partial-RX buffers may be reused by the driver
+    // as soon as this callback returns. Never retain received_symbols.
+    for (size_t i = 0; i < data->num_symbols; ++i) {
+        const rmt_symbol_word_t& s = data->received_symbols[i];
+        pulse(*c, s.duration0, s.level0);
+        pulse(*c, s.duration1, s.level1);
+    }
+    if (data->flags.is_last) {
+        // A final RMT half-symbol may have duration=0 even though its level
+        // encodes the final physical transition. Preserve that edge ONLY if:
+        //  - a valid first half-symbol precedes it,
+        //  - the final level differs from the last captured level, and
+        //  - a GPIO sample after RX idle corroborates that final level.
+        // Its timestamp is the end of the previous measured half-symbol;
+        // this is a bounded reconstruction, not a speculative STOP based
+        // solely on the idle GPIO level. Count each recovery explicitly.
+        if (data->num_symbols != 0) {
+            const auto& tail = data->received_symbols[data->num_symbols - 1u];
+            if (tail.duration0 != 0 && tail.duration1 == 0 &&
+                c->levelKnown && tail.level1 != c->currentLevel &&
+                gpio_get_level(c->pin) == static_cast<int>(tail.level1)) {
+                emit(*c, c->elapsedTicks, tail.level1 != 0);
+                c->currentLevel = tail.level1;
+            }
+        }
+        c->receiving = false;
+        // At RX_END the last input level has remained stable for the idle
+        // threshold. RMT starts counting at the first edge of this burst.
+        // Estimate the epoch from RX_END minus captured pulse durations and
+        // the final timeout, rather than the unrelated arm() time. This is
+        // still SOFTWARE timestamp alignment: ISR scheduling and the final
+        // symbol truncation introduce uncertainty (particularly at 400 kHz).
+        const uint32_t endTicks = callbackUs * 10u;
+        const uint32_t epoch = endTicks - c->elapsedTicks - kIdleNs / 100u;
+        const uint8_t w = c->completionW;
+        const uint8_t next = (uint8_t)((w + 1u) & kCompletionMask);
+        if (next == __atomic_load_n(&c->completionR, __ATOMIC_ACQUIRE)) {
+            // Completion metadata was lost: previous edges must not be
+            // decoded with a stale/unrelated timestamp origin.
+            c->overflow = true;
+            ++overflows;
+        } else {
+            c->completions[w] = {c->burstStart, c->write, epoch, endTicks};
+            __atomic_store_n(&c->completionW, next, __ATOMIC_RELEASE);
+        }
+        // ESP-IDF allows rmt_receive() in ISR context. Do this *before*
+        // rewriting any timestamps or running calibration on the main core.
+        if (running) arm(*c);
+    }
+    return false;
+}
+// Resources survive repeated sniffs; only I2C mode exit frees them.
+static void dispose(Channel& c) {
+    if (c.handle) {
+        if (c.enabled) rmt_disable(c.handle);
+        rmt_del_channel(c.handle);
+        c.handle = nullptr;
+    }
+    c.enabled = false;
+    if (c.symbols) { heap_caps_free(c.symbols); c.symbols = nullptr; }
+    if (c.edges) { heap_caps_free(c.edges); c.edges = nullptr; }
+    c.write = c.read = c.readyWrite = 0;
+    c.completionW = c.completionR = 0;
+    c.receiving = false;
+    c.haveProgress = false;
+}
+
+bool prepare() {
+    if (captureMemory) return true;
+    void* storage = heap_caps_malloc(
+        sizeof(CaptureMemory), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    CaptureMemory* mem = storage ? new (storage) CaptureMemory{} : nullptr;
+    if (!mem) {
+        earlyFailure = "RMT state: ESP_ERR_NO_MEM";
+        return false;
+    }
+    // No hardware channel is installed here: doing so could reconfigure
+    // SDA/SCL while the I2C mode itself is using Wire.
+    mem->clock.edges = static_cast<uint32_t*>(heap_caps_malloc(
+        kRingSize * sizeof(uint32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    mem->dataPin.edges = static_cast<uint32_t*>(heap_caps_malloc(
+        kRingSize * sizeof(uint32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    mem->clock.symbols = static_cast<rmt_symbol_word_t*>(heap_caps_malloc(
+        kRxSymbols * sizeof(rmt_symbol_word_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA));
+    mem->dataPin.symbols = static_cast<rmt_symbol_word_t*>(heap_caps_malloc(
+        kRxSymbols * sizeof(rmt_symbol_word_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!mem->clock.edges || !mem->dataPin.edges || !mem->clock.symbols || !mem->dataPin.symbols) {
+        heap_caps_free(mem->clock.edges);
+        heap_caps_free(mem->dataPin.edges);
+        heap_caps_free(mem->clock.symbols);
+        heap_caps_free(mem->dataPin.symbols);
+        mem->~CaptureMemory();
+        heap_caps_free(mem);
+        earlyFailure = "RMT buffers: ESP_ERR_NO_MEM";
+        return false;
+    }
+    captureMemory = mem;
+    return true;
+}
+
+static void resetChannel(Channel& c) {
+    c.write = c.read = c.readyWrite = 0;
+    c.completionW = c.completionR = 0;
+    c.burstStart = 0;
+    c.progress = 0;
+    c.haveProgress = false;
+    c.overflow = false;
+    c.rxError = ESP_OK;
+    c.completed = 0;
+    c.currentLevel = 1;
+    c.levelKnown = false;
+    c.started = false;
+    c.receiving = false;
+}
+
+static bool init(Channel& c, uint8_t pin, bool dma, const char* label) {
+    // A GPIO change while staying in I2C mode requires a new channel route.
+    // The expensive capture buffers remain allocated across this change.
+    if (c.handle && c.pin != static_cast<gpio_num_t>(pin)) {
+        if (c.enabled) rmt_disable(c.handle);
+        rmt_del_channel(c.handle);
+        c.handle = nullptr;
+        c.enabled = false;
+    }
+    resetChannel(c);
+    c.pin = static_cast<gpio_num_t>(pin);
+    if (!c.handle) {
+        rmt_rx_channel_config_t cfg = {};
+        cfg.gpio_num = static_cast<gpio_num_t>(pin);
+        cfg.clk_src = RMT_CLK_SRC_DEFAULT;
+        cfg.resolution_hz = kHz;
+        cfg.mem_block_symbols = dma ? kRxSymbols : kSdaMemSymbols;
+        cfg.flags.with_dma = dma;
+        esp_err_t e = rmt_new_rx_channel(&cfg, &c.handle);
+        if (e != ESP_OK) {
+            snprintf(failureBuffer(), sizeof(captureMemory->failure), "%s new channel: %s", label, esp_err_to_name(e));
+            return false;
+        }
+        rmt_rx_event_callbacks_t cb = {};
+        cb.on_recv_done = onDone;
+        e = rmt_rx_register_event_callbacks(c.handle, &cb, &c);
+        if (e != ESP_OK) {
+            snprintf(failureBuffer(), sizeof(captureMemory->failure), "%s register callbacks: %s", label, esp_err_to_name(e));
+            rmt_del_channel(c.handle);
+            c.handle = nullptr;
+            return false;
+        }
+    }
+    const esp_err_t e = rmt_enable(c.handle);
+    if (e != ESP_OK) {
+        snprintf(failureBuffer(), sizeof(captureMemory->failure), "%s RMT enable: %s", label, esp_err_to_name(e));
+        return false;
+    }
+    c.enabled = true;
+    return true;
+}
+
+void stop() {
+    running = false;
+    if (!captureMemory) return;
+    Channel* channels[2] = {&scl(), &sda()};
+    for (Channel* c : channels) {
+        if (c->handle && c->enabled) {
+            rmt_disable(c->handle);
+            c->enabled = false;
+        }
+        resetChannel(*c);
+    }
+    alignmentValid = false;
+}
+
+void release() {
+    stop();
+    if (!captureMemory) return;
+    dispose(scl());
+    dispose(sda());
+    CaptureMemory* old = captureMemory;
+    captureMemory = nullptr;
+    old->~CaptureMemory();
+    heap_caps_free(old);
+}
+
+bool begin(uint8_t sclPin, uint8_t sdaPin) {
+    stop();
+    if (!prepare()) return false;
+    errors = overflows = acknowledgedErrors = 0;
+    sdaSkewTicks = 0;
+    calibratedSclCompleted = calibratedSdaCompleted = calibrationCount = 0;
+    alignmentFailures = reportedAlignmentFailures = 0;
+    alignmentValid = false;
+    snprintf(failureBuffer(), sizeof(captureMemory->failure), "none");
+    rxConfig = {};
+    rxConfig.signal_range_min_ns = 100;  // one 10-MHz tick
+    rxConfig.signal_range_max_ns = kIdleNs;
+    rxConfig.flags.en_partial_rx = 1;
+    if (!init(scl(), sclPin, true, "SCL DMA") ||
+        !init(sda(), sdaPin, false, "SDA non-DMA")) {
+        stop();
+        return false;
+    }
+    running = true;
+    if (!arm(scl()) || !arm(sda())) {
+        snprintf(failureBuffer(), sizeof(captureMemory->failure), "RMT receive start failed (SCL=%d SDA=%d)", (int)scl().rxError, (int)sda().rxError);
+        stop();
+        return false;
+    }
+    return true;
+}
+// Apply the completion's epoch only after the ISR has already restarted RX.
+// readyWrite is the publication fence: next() cannot read relative timestamps
+// from a not-yet-finalized burst. The ISR is the only ring-edge producer;
+// completed bursts can be patched here while it appends later bursts.
+static void finalize(Channel& c) {
+    while (true) {
+        const uint8_t r = c.completionR;
+        if (r == __atomic_load_n(&c.completionW, __ATOMIC_ACQUIRE)) break;
+        const Completion meta = c.completions[r];
+        uint16_t i = meta.start;
+        while (i != meta.end) {
+            const uint32_t e = c.edges[i];
+            c.edges[i] = (((e & kTickMask) + meta.epoch) & kTickMask) |
+                         (e & 0x80000000UL);
+            i = (uint16_t)((i + 1u) & kRingMask);
+        }
+        __atomic_store_n(&c.readyWrite, meta.end, __ATOMIC_RELEASE);
+        __atomic_store_n(&c.progress, meta.progress, __ATOMIC_RELEASE);
+        __atomic_store_n(&c.haveProgress, true, __ATOMIC_RELEASE);
+        ++c.completed;
+        __atomic_store_n(&c.completionR, (uint8_t)((r + 1u) & kCompletionMask), __ATOMIC_RELEASE);
+    }
+}
+void poll() {
+    if (!running || !captureMemory) return;
+    // If completion bookkeeping or the edge ring overflowed, none of the
+    // unpublished edges has a trustworthy timestamp. Discard the backlog and
+    // leave the decoder to resync at a subsequent START.
+    if (!scl().overflow && !sda().overflow) {
+        finalize(scl());
+        finalize(sda());
+    }
+    // Retry an ISR rearm failure in main context, as before.
+    if (!scl().receiving) arm(scl());
+    if (!sda().receiving) arm(sda());
+}
+static inline bool before(uint32_t a, uint32_t b) {
+    return (((a - b) & kTickMask) & 0x40000000UL) != 0;
+}
+static inline bool peek(Channel& c, uint32_t& e) {
+    const uint16_t r = c.read;
+    if (r == __atomic_load_n(&c.readyWrite, __ATOMIC_ACQUIRE)) return false;
+    e = c.edges[r];
+    return true;
+}
+// RMT RX starts at the FIRST GPIO edge on *each* channel. An RX_DONE ISR
+// timestamp is not a hardware epoch; the two ISRs can arrive dozens of us
+// apart. The previous ±10us callback-based calibration consequently stayed
+// at cal=0 in real captures, while next() decoded their misordered edges.
+//
+// Instead, align the beginning of complete RX bursts to I2C itself: on an
+// idle bus SDA falls for START before SCL's first falling clock edge. Both
+// RMT streams then measure intervals in the same 10MHz clock domain. Search
+// the physically allowed START-hold interval and score the *entire* waveform
+// for SCL-high control transitions and valid 9-clock I2C byte boundaries.
+// This is a protocol-based estimate, NOT a shared hardware timestamp. If it
+// cannot be established, discard the ambiguous burst rather than print fake
+// START/STOP/ACK. Alignments are not guaranteed for every waveform.
+static int32_t relativeTime(uint32_t tick, uint32_t origin) {
+    const uint32_t d = (tick - origin) & kTickMask;
+    return (d & 0x40000000UL) ? (int32_t)(d - 0x80000000UL) : (int32_t)d;
+}
+static size_t sample(Channel& c, CalEdge* out, size_t maxCount, uint32_t origin) {
+    uint16_t idx = __atomic_load_n(&c.read, __ATOMIC_ACQUIRE);
+    const uint16_t end = __atomic_load_n(&c.readyWrite, __ATOMIC_ACQUIRE);
+    size_t n = 0;
+    while (idx != end && n < maxCount) {
+        const uint32_t e = c.edges[idx];
+        out[n++] = { relativeTime(e & kTickMask, origin), (e & 0x80000000UL) != 0 };
+        idx = (uint16_t)((idx + 1u) & kRingMask);
+    }
+    return n;
+}
+static int evaluateSkew(const CalEdge* clk, size_t nc,
+                        const CalEdge* dat, size_t nd, int shift) {
+    size_t i = 0, j = 0;
+    bool high = true;
+    bool active = false;
+    int rises = 0;
+    int score = 0;
+    int goodFrames = 0;
+    const int32_t lastClockInterval = (nc > 1) ? clk[nc - 1].tick - clk[nc - 2].tick : 100;
+    const int32_t tailWindow = (lastClockInterval > 0) ? ((lastClockInterval * 3 < 3000) ? lastClockInterval * 3 : 3000) : 150;
+    // Retain correct signal states and score only actual I2C control edges.
+    while (i < nc || j < nd) {
+        // Calibration samples are bounded independently (256 SCL, 192
+        // SDA). Never score SDA from later transactions after SCL's sample
+        // ends: that would create dozens of spurious START/STOP penalties.
+        if (i == nc && (j == nd || dat[j].tick + shift > clk[nc - 1].tick + tailWindow)) break;
+        const bool chooseData = j < nd && (i == nc ||
+            dat[j].tick + shift < clk[i].tick ||
+            (dat[j].tick + shift == clk[i].tick && clk[i].rise));
+        if (!chooseData) {
+            high = clk[i].rise;
+            if (high && active) ++rises;
+            ++i;
+        } else {
+            if (high) {
+                if (!dat[j].rise) {
+                    if (active) {
+                        if (rises >= 9 && (rises % 9) <= 1) {
+                            score += 120;
+                            ++goodFrames; // valid repeated START boundary
+                        } else score -= 100;
+                    }
+                    active = true;
+                    rises = 0;
+                    score += 10;
+                } else {
+                    if (active && rises >= 9 && (rises % 9) <= 1) {
+                        score += 110;
+                        ++goodFrames;
+                    } else score -= 100;
+                    active = false;
+                }
+            } else {
+                ++score;
+            }
+            ++j;
+        }
+    }
+    // A short accidental alignment can create one plausible control edge.
+    // Require at least one complete byte-aligned frame before decoding.
+    return goodFrames ? score : INT_MIN / 4;
+}
+static void calibrateIfReady() {
+    const uint32_t sc = __atomic_load_n(&scl().completed, __ATOMIC_ACQUIRE);
+    const uint32_t sd = __atomic_load_n(&sda().completed, __ATOMIC_ACQUIRE);
+    if (sc == calibratedSclCompleted || sd == calibratedSdaCompleted) return;
+
+    // Stay within the normal GPIO rings; no dynamic allocation in ISR.
+    CalEdge* const clocks = captureMemory->clocks;
+    CalEdge* const data = captureMemory->data;
+    uint32_t first;
+    if (!peek(scl(), first)) return;
+    const uint32_t origin = first & kTickMask;
+    const size_t nc = sample(scl(), clocks, 256, origin);
+    const size_t nd = sample(sda(), data, 192, origin);
+    if (nc < 18 || nd < 3) return;
+
+    // Anchor SDA's START falling edge to a FALLING SCL edge after it.
+    // Do not limit the absolute ISR-offset correction to ±10us: the
+    // callback delay can be much larger, even on a 100kHz bus.
+    int bestScore = INT_MIN;
+    int bestShift = 0;
+    // At identical scores, prefer SDA slightly earlier within the verified
+    // setup/hold window. The old smallest-hold tie break moved SDA later,
+    // which can classify the preparatory SDA release before a repeated START
+    // as a STOP at Fast-mode rates while leaving every address byte correct.
+    int bestHold = INT_MIN;
+    for (size_t ci = 0, triedClocks = 0; ci < nc && triedClocks < 1; ++ci) {
+        if (clocks[ci].rise) continue;
+        ++triedClocks;
+        int32_t lowTicks = 0;
+        for (size_t next = ci + 1; next < nc; ++next) {
+            if (clocks[next].rise) {
+                lowTicks = clocks[next].tick - clocks[ci].tick;
+                break;
+            }
+        }
+        if (lowTicks <= 0) continue;
+        // At 100kHz tHD;STA can be ~4-5us; at 400kHz ~0.6us.
+        // Include the wider legal/implementation-dependent hold interval.
+        const int maxHold = (int)((lowTicks + 3 < 3000) ? lowTicks + 3 : 3000);
+        for (size_t di = 0, triedData = 0; di < nd && triedData < 1; ++di) {
+            if (data[di].rise) continue;
+            ++triedData;
+            for (int hold = 1; hold <= maxHold; hold += 3) {
+                const int shift = clocks[ci].tick - data[di].tick - hold;
+                const int score = evaluateSkew(clocks, nc, data, nd, shift);
+                if (score > bestScore || (score == bestScore &&
+                    hold > bestHold)) {
+                    bestScore = score;
+                    bestShift = shift;
+                    bestHold = hold;
+                }
+            }
+        }
+    }
+    calibratedSclCompleted = sc;
+    calibratedSdaCompleted = sd;
+    // A score >=90 entails at least one complete nine-clock frame and a
+    // reasonable number of SDA changes. Never trust a failed calibration.
+    if (bestScore >= 90) {
+        sdaSkewTicks = bestShift;
+        alignmentValid = true;
+        ++calibrationCount;
+    } else {
+        alignmentValid = false;
+        ++alignmentFailures;
+        // Drop both ambiguous ready queues. RMT has no common epoch, so
+        // keeping them would render all following bytes meaningless.
+        __atomic_store_n(&scl().read, __atomic_load_n(&scl().readyWrite, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+        __atomic_store_n(&sda().read, __atomic_load_n(&sda().readyWrite, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+    }
+}
+bool next(Edge& result, bool& isSda) {
+    if (!running || !captureMemory || !scl().haveProgress || !sda().haveProgress) return false;
+    calibrateIfReady();
+    if (!alignmentValid ||
+        __atomic_load_n(&scl().completed, __ATOMIC_ACQUIRE) != calibratedSclCompleted ||
+        __atomic_load_n(&sda().completed, __ATOMIC_ACQUIRE) != calibratedSdaCompleted) return false;
+    const uint32_t limitScl = __atomic_load_n(&scl().progress, __ATOMIC_ACQUIRE);
+    const uint32_t limitSda = __atomic_load_n(&sda().progress, __ATOMIC_ACQUIRE);
+    const uint32_t limit = before(limitScl, limitSda) ? limitScl : limitSda;
+    uint32_t a = 0, b = 0;
+    const bool ha = peek(scl(), a), hb = peek(sda(), b);
+    if (!ha && !hb) return false;
+    const uint32_t ta = a & 0x7FFFFFFFUL;
+    const uint32_t tb = ((b & kTickMask) + sdaSkewTicks) & kTickMask;
+    bool chooseSda = !ha || (hb && (ta == tb ? ((a & 0x80000000UL) != 0) : before(tb, ta)));
+    // Compare wrapped 31-bit time values. No two enqueued events should be
+    // separated by 2^30 ticks (107 seconds at 10MHz).
+    const uint32_t t = chooseSda ? tb : ta;
+    if (before(limit - kGuardTicks, t)) return false;
+    Channel& c = chooseSda ? sda() : scl();
+    __atomic_store_n(&c.read, (uint16_t)((c.read + 1u) & kRingMask), __ATOMIC_RELEASE);
+    result.ticks = t;
+    result.rising = ((chooseSda ? b : a) & 0x80000000UL) != 0;
+    isSda = chooseSda;
+    return true;
+}
+bool drained() {
+    // Only finalized edges are visible via readyWrite. Pending completion
+    // records must be processed before the decoder may finalize a tail STOP.
+    return running && captureMemory &&
+           scl().read == __atomic_load_n(&scl().readyWrite, __ATOMIC_ACQUIRE) &&
+           sda().read == __atomic_load_n(&sda().readyWrite, __ATOMIC_ACQUIRE) &&
+           scl().completionR == __atomic_load_n(&scl().completionW, __ATOMIC_ACQUIRE) &&
+           sda().completionR == __atomic_load_n(&sda().completionW, __ATOMIC_ACQUIRE);
+}
+bool takeAlignmentFailure() {
+    if (!captureMemory) return false;
+    const uint32_t count = __atomic_load_n(&alignmentFailures, __ATOMIC_ACQUIRE);
+    if (count == reportedAlignmentFailures) return false;
+    reportedAlignmentFailures = count;
+    return true;
+}
+bool takeOverflow() {
+    if (!captureMemory) return false;
+    const uint32_t nowErrors = errors;
+    const bool bad = scl().overflow || sda().overflow || nowErrors != acknowledgedErrors;
+    acknowledgedErrors = nowErrors;
+    if (bad) {
+        // Clear both streams atomically with respect to the ISR writers.
+        // Published bytes may already have reached the output; future data
+        // must begin from a fresh, complete RX burst pair.
+        Channel* const channels[2] = {&scl(), &sda()};
+        for (Channel* c : channels) {
+            __atomic_store_n(&c->read, __atomic_load_n(&c->write, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+            __atomic_store_n(&c->readyWrite, c->read, __ATOMIC_RELEASE);
+            __atomic_store_n(&c->completionR, __atomic_load_n(&c->completionW, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+            c->overflow = false;
+        }
+        alignmentValid = false;
+        calibratedSclCompleted = scl().completed;
+        calibratedSdaCompleted = sda().completed;
+    }
+    return bad;
+}
+const char* lastError() { return captureMemory ? failureBuffer() : earlyFailure; }
+}
+#else
+namespace I2cRmtCapture {
+bool prepare() { return false; }
+bool begin(uint8_t, uint8_t) { return false; }
+void stop() {}
+void poll() {}
+bool next(Edge&, bool&) { return false; }
+bool takeOverflow() { return false; }
+bool takeAlignmentFailure() { return false; }
+bool drained() { return false; }
+const char* lastError() { return "RMT DMA unsupported"; }
+void release() {}
+}
+#endif
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// Decoded event ring (main-context producer -> text formatter consumer)
+// ---------------------------------------------------------------------------
+
+#define TAG_START    0x1
+#define TAG_STOP     0x2
+#define TAG_DATA     0x3
+#define TAG_ADDR     0x4
+#define TAG_ACK      0x5
+#define TAG_OVERFLOW 0x6
+#define TAG_UNSYNC 0x7
+
+static inline uint16_t PACK_EVENT(uint16_t tag, uint16_t value) {
+    return (uint16_t)((tag << 12) | (value & 0x0FFF));
+}
+static inline uint8_t EVENT_TAG(uint16_t ev) {
+    return (uint8_t)((ev >> 12) & 0x0F);
+}
+static inline uint16_t EVENT_VAL(uint16_t ev) {
+    return (uint16_t)(ev & 0x0FFF);
+}
+
+#define EVENT_RING_ORDER 11
+#define EVENT_RING_SIZE  (1u << EVENT_RING_ORDER)
+#define EVENT_RING_MASK  (EVENT_RING_SIZE - 1u)
+
+
+
+
+
+void I2cSnifferService::push_event(uint16_t ev) {
+    if (eventRing == nullptr) {
+        return;
+    }
+
+    const uint16_t next = (uint16_t)((eventW + 1u) & EVENT_RING_MASK);
+    if (next == eventR) {
+        eventOverflow = true;
+        return;
+    }
+
+    eventRing[eventW] = ev;
+    eventW = next;
+}
+
+// ---------------------------------------------------------------------------
+// Output character ring
+// ---------------------------------------------------------------------------
+
+#define CHAR_RING_ORDER 13
+#define CHAR_RING_SIZE  (1u << CHAR_RING_ORDER)
+#define CHAR_RING_MASK  (CHAR_RING_SIZE - 1u)
+
+
+
+
+
+void I2cSnifferService::char_push(char c) {
+    if (charRing == nullptr) {
+        return;
+    }
+
+    const uint16_t next = (uint16_t)((charW + 1u) & CHAR_RING_MASK);
+    if (next == charR) {
+        // Do not move charR here: overwriting the oldest bytes produces the
+        // misleading truncated lines seen with the previous implementation.
+        charOverflow = true;
+        return;
+    }
+
+    charRing[charW] = c;
+    charW = next;
+}
+
+void I2cSnifferService::text_push_str(const char* s) {
+    while (*s) {
+        char_push(*s++);
+    }
+}
+
+void I2cSnifferService::text_push_hex8(uint8_t value) {
+    static const char HEX_DIGITS[] = "0123456789ABCDEF";
+    char_push('0');
+    char_push('x');
+    char_push(HEX_DIGITS[(value >> 4) & 0x0F]);
+    char_push(HEX_DIGITS[value & 0x0F]);
+}
+
+// ---------------------------------------------------------------------------
+// I2C decoder state (main context only)
+// ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+// SDA transitions observed while the *decoded* SCL level is HIGH are not
+// immediately trusted. A missing SCL falling capture can otherwise turn SDA
+// data transitions into phantom START/STOP pairs.
+
+
+static constexpr uint8_t MAX_PENDING_CONTROLS = 8;
+
+
+
+
+
+
+void I2cSnifferService::reset_decoder_state(bool samplePins) {
+    decoderInTransaction = false;
+    pendingControlCount = 0;
+    pendingControlEdges = 0;
+    decoderBitCount = 0;
+    decoderByte = 0;
+    decoderByteCount = 0;
+    decoderExpectingAck = false;
+    frameAccepted = !addressFilterEnabled;
+
+    if (samplePins) {
+        decoderScl = (uint8_t)(gpio_get_level((gpio_num_t)sniffer_scl_pin) != 0);
+        decoderSda = (uint8_t)(gpio_get_level((gpio_num_t)sniffer_sda_pin) != 0);
+    } else {
+        decoderScl = 1;
+        decoderSda = 1;
+    }
+}
+
+void I2cSnifferService::decoder_start() {
+    // START and repeated START both begin a fresh address phase.
+    if (!addressFilterEnabled) {
+        push_event(PACK_EVENT(TAG_START, 0));
+    }
+
+    decoderInTransaction = true;
+    decoderBitCount = 0;
+    decoderByte = 0;
+    decoderByteCount = 0;
+    decoderExpectingAck = false;
+    frameAccepted = !addressFilterEnabled;
+}
+
+void I2cSnifferService::decoder_stop() {
+    if (!decoderInTransaction) {
+        return;
+    }
+
+    if (frameAccepted) {
+        push_event(PACK_EVENT(TAG_STOP, 0));
+    }
+
+    decoderInTransaction = false;
+    decoderBitCount = 0;
+    decoderByte = 0;
+    decoderByteCount = 0;
+    decoderExpectingAck = false;
+    frameAccepted = !addressFilterEnabled;
+}
+
+void I2cSnifferService::decoder_sample_sda_on_scl_rise() {
+    if (!decoderInTransaction) {
+        return;
+    }
+
+    if (decoderExpectingAck) {
+        if (frameAccepted) {
+            push_event(PACK_EVENT(TAG_ACK, decoderSda ? 1u : 0u));
+        }
+        decoderExpectingAck = false;
+        decoderBitCount = 0;
+        decoderByte = 0;
+        return;
+    }
+
+    decoderByte = (uint8_t)((decoderByte << 1) | (decoderSda & 0x01u));
+    decoderBitCount++;
+
+    if (decoderBitCount != 8) {
+        return;
+    }
+
+    if (decoderByteCount == 0) {
+        const uint8_t addr = (uint8_t)((decoderByte >> 1) & 0x7F);
+        frameAccepted = !addressFilterEnabled || (addr == addressFilter);
+
+        if (frameAccepted) {
+            // With a filter enabled, defer START until the address byte proves
+            // this phase belongs to the requested device.
+            if (addressFilterEnabled) {
+                push_event(PACK_EVENT(TAG_START, 0));
+            }
+            push_event(PACK_EVENT(TAG_ADDR, decoderByte));
+        }
+    } else if (frameAccepted) {
+        push_event(PACK_EVENT(TAG_DATA, decoderByte));
+    }
+
+    decoderByteCount++;
+    decoderExpectingAck = true;
+}
+
+void I2cSnifferService::commit_pending_controls() {
+    for (uint8_t i = 0; i < pendingControlCount; ++i) {
+        if (pendingControlEdges & (1u << i)) {
+            decoder_stop();
+        } else {
+            decoder_start();
+        }
+    }
+    pendingControlCount = 0;
+    pendingControlEdges = 0;
+}
+
+void I2cSnifferService::process_scl_edge(bool positive) {
+
+    if (positive) {
+        if (decoderScl != 0) {
+            // The falling edge was not captured. Normally SDA transitions
+            // since the preceding rise belong to this missing LOW phase and
+            // must not create phantom START/STOP events.
+            //
+            // Exception: when idle, a single falling SDA edge can be the
+            // real START whose *first* SCL falling edge was missed. Accept
+            // that START before sampling this rising edge; otherwise the
+            // first address bit is lost (e.g. 0x39 W -> 0x72 R).
+            const bool idleStart = !decoderInTransaction &&
+                                   pendingControlCount == 1 &&
+                                   pendingControlEdges == 0;
+            if (idleStart) {
+                commit_pending_controls();
+            } else {
+                pendingControlCount = 0;
+                pendingControlEdges = 0;
+            }
+        }
+        decoderScl = 1;
+        decoder_sample_sda_on_scl_rise();
+    } else {
+        // A genuine HIGH -> LOW clock transition confirms SDA control edges
+        // observed while HIGH, including a quick STOP -> START scan boundary.
+        if (decoderScl != 0) {
+            commit_pending_controls();
+        } else {
+            // LOW -> LOW implies a missed rise. Byte alignment is unknown:
+            // don't invent bits from the incomplete clock cycle.
+            decoderInTransaction = false;
+            decoderBitCount = 0;
+            decoderExpectingAck = false;
+            pendingControlCount = 0;
+            pendingControlEdges = 0;
+        }
+        decoderScl = 0;
+    }
+}
+
+void I2cSnifferService::process_sda_edge(bool positive) {
+    decoderSda = positive ? 1 : 0;
+    if (decoderScl == 0) {
+        return;
+    }
+
+    // Defer classification until the next SCL edge. This also retains the
+    // order of a fast STOP -> START pair preceding the next SCL falling edge.
+    if (pendingControlCount < MAX_PENDING_CONTROLS) {
+        if (positive) {
+            pendingControlEdges |= (uint8_t)(1u << pendingControlCount);
+        }
+        ++pendingControlCount;
+    } else {
+        // No legitimate scan needs >8 SDA control transitions without SCL.
+        // Drop this ambiguous burst rather than emit phantom frames.
+        pendingControlCount = 0;
+        pendingControlEdges = 0;
+        decoderInTransaction = false;
+    }
+}
+
+void I2cSnifferService::process_capture_edge(bool isSda, bool rising) {
+    if (isSda) {
+        process_sda_edge(rising);
+    } else {
+        process_scl_edge(rising);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event -> text formatting (main context)
+// ---------------------------------------------------------------------------
+
+void I2cSnifferService::pump_events_to_text() {
+    static constexpr uint16_t MAX_EVENTS_PER_PUMP = 256;
+    uint16_t processed = 0;
+
+    while (processed < MAX_EVENTS_PER_PUMP && eventR != eventW) {
+        const uint16_t ev = eventRing[eventR];
+        eventR = (uint16_t)((eventR + 1u) & EVENT_RING_MASK);
+
+        switch (EVENT_TAG(ev)) {
+            case TAG_START:
+                text_push_str("[S] ");
+                break;
+
+            case TAG_STOP:
+                text_push_str("[P]");
+                char_push('\n');
+                break;
+
+            case TAG_ADDR: {
+                const uint8_t b = (uint8_t)EVENT_VAL(ev);
+                text_push_str("ADDR ");
+                text_push_hex8((uint8_t)((b >> 1) & 0x7F));
+                char_push(' ');
+                char_push((b & 0x01u) ? 'R' : 'W');
+                char_push(' ');
+                break;
+            }
+
+            case TAG_DATA:
+                text_push_hex8((uint8_t)EVENT_VAL(ev));
+                char_push(' ');
+                break;
+
+            case TAG_ACK:
+                text_push_str(EVENT_VAL(ev) == 0 ? "<ACK> " : "<NACK> ");
+                break;
+
+            case TAG_OVERFLOW:
+                text_push_str("[!] CAPTURE OVERFLOW - resync at next START");
+                char_push('\n');
+                break;
+            case TAG_UNSYNC:
+                text_push_str("[!] RMT UNSYNCHRONIZED - discarded burst");
+                char_push('\n');
+                break;
+
+            default:
+                break;
+        }
+
+        processed++;
+    }
+
+    if (eventOverflow) {
+        eventOverflow = false;
+        text_push_str("[!] DECODE BUFFER OVERFLOW");
+        char_push('\n');
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RMT capture lifecycle
+// ---------------------------------------------------------------------------
+bool I2cSnifferService::prepare() {
+    if (!I2cRmtCapture::prepare()) {
+        snifferSetupError = I2cRmtCapture::lastError();
+        return false;
+    }
+    if (!ensure_buffers_allocated()) {
+        snifferSetupError = "failed to allocate sniffer buffers";
+        return false;
+    }
+    return true;
+}
+
+bool I2cSnifferService::ensure_buffers_allocated() {
+    if (!eventRing) {
+        eventRing = static_cast<uint16_t*>(heap_caps_malloc(
+            EVENT_RING_SIZE * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+    if (!charRing) {
+        charRing = static_cast<char*>(heap_caps_malloc(
+            CHAR_RING_SIZE * sizeof(char), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+    return eventRing && charRing;
+}
+
+void I2cSnifferService::reset_buffers_and_decoder() {
+    eventW = eventR = 0;
+    charW = charR = 0;
+    eventOverflow = false;
+    charOverflow = false;
+    reset_decoder_state(true);
+}
+
+void I2cSnifferService::begin(uint8_t scl, uint8_t sda) {
+    sniffer_scl_pin = scl;
+    sniffer_sda_pin = sda;
+}
+
+void I2cSnifferService::setAddressFilter(bool enabled, uint8_t address) {
+    addressFilterEnabled = enabled;
+    addressFilter = (uint8_t)(address & 0x7F);
+    frameAccepted = !enabled;
+}
+
+const char* I2cSnifferService::backendName() const { return "RMT RX"; }
+
+const char* I2cSnifferService::lastError() const { return snifferSetupError; }
+
+bool I2cSnifferService::setup() {
+    snifferSetupError = "none";
+    if (!prepare()) return false;
+    // Passive monitor: the live I2C bus must provide its own pull-ups.
+    pinMode(sniffer_scl_pin, INPUT);
+    pinMode(sniffer_sda_pin, INPUT);
+    reset_buffers_and_decoder();
+    lastRmtPumpUs = 0;
+    if (!I2cRmtCapture::begin(sniffer_scl_pin, sniffer_sda_pin)) {
+        snifferSetupError = I2cRmtCapture::lastError();
+        I2cRmtCapture::stop();
+        return false;
+    }
+    return true;
+}
+
+void I2cSnifferService::stop() {
+    I2cRmtCapture::stop();
+    reset_decoder_state(true);
+}
+
+void I2cSnifferService::release() {
+    stop();
+    I2cRmtCapture::release();
+    eventW = eventR = 0;
+    charW = charR = 0;
+    uint16_t* oldEvents = eventRing;
+    char* oldChars = charRing;
+    eventRing = nullptr;
+    charRing = nullptr;
+    heap_caps_free(oldEvents);
+    heap_caps_free(oldChars);
+}
+
+bool I2cSnifferService::available() {
+    if (!charRing || !eventRing) return false;
+
+    // Serve existing text without expensive re-calibration on every byte.
+    // Keep processing acquisition at least every 200us under heavy output.
+    const uint32_t nowUs = micros();
+    if (charR != charW && (uint32_t)(nowUs - lastRmtPumpUs) < 200u) {
+        return true;
+    }
+    lastRmtPumpUs = nowUs;
+
+    I2cRmtCapture::poll();
+    if (I2cRmtCapture::takeOverflow()) {
+        reset_decoder_state(true);
+        push_event(PACK_EVENT(TAG_OVERFLOW, 0));
+    }
+    I2cRmtCapture::Edge edge;
+    bool isSda = false;
+    static constexpr unsigned MAX_RMT_EDGES_PER_PUMP = 2048;
+    unsigned processed = 0;
+    while (processed < MAX_RMT_EDGES_PER_PUMP &&
+           I2cRmtCapture::next(edge, isSda)) {
+        process_capture_edge(isSda, edge.rising);
+        ++processed;
+    }
+    if (I2cRmtCapture::takeAlignmentFailure()) {
+        reset_decoder_state(true);
+        push_event(PACK_EVENT(TAG_UNSYNC, 0));
+    }
+
+    // Commit the actual SDA STOP captured by RMT once both RX streams are
+    // drained and the bus is HIGH/HIGH. Never invent a STOP from GPIO alone.
+    const bool trailingStop = pendingControlCount != 0 &&
+        (pendingControlEdges & (1u << (pendingControlCount - 1u))) != 0;
+    if (trailingStop && I2cRmtCapture::drained() &&
+        gpio_get_level((gpio_num_t)sniffer_scl_pin) != 0 &&
+        gpio_get_level((gpio_num_t)sniffer_sda_pin) != 0) {
+        commit_pending_controls();
+    }
+
+    if (charR == charW) pump_events_to_text();
+    if (charOverflow && charR == charW) {
+        charOverflow = false;
+        text_push_str("[!] OUTPUT BUFFER OVERFLOW");
+        char_push('\n');
+    }
+    return charR != charW;
+}
+
+char I2cSnifferService::read() {
+    if (!charRing || charR == charW) {
+        if (!available()) return '\0';
+    }
+    const char out = charRing[charR];
+    charR = (uint16_t)((charR + 1u) & CHAR_RING_MASK);
+    return out;
+}
+
+void I2cSnifferService::resetBuffer() {
+    if (!charRing || !eventRing) return;
+    reset_buffers_and_decoder();
+}
