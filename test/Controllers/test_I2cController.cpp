@@ -5,7 +5,7 @@
 #include "../Services/FakeI2cService.h"
 #include "../Services/FakeUtilityService.h"
 #include "../Shells/FakeI2cEepromShell.h"
-#include "../Vendors/FakeI2cSniffer.h"
+#include "../Services/FakeI2cSnifferService.h"
 #include "../Views/FakeTerminalView.h"
 
 namespace i2c_controller_tests {
@@ -15,6 +15,7 @@ struct I2cControllerFixture {
     FakeInput input;
     FakeUtilityService utility;
     FakeI2cService i2cService;
+    FakeI2cSnifferService snifferService;
     FakeI2cEepromShell eepromShell;
     ArgTransformer transformer;
     UserInputManager userInput{view, input, transformer};
@@ -24,6 +25,7 @@ struct I2cControllerFixture {
         input,
         utility,
         i2cService,
+        snifferService,
         transformer,
         userInput,
         eepromShell,

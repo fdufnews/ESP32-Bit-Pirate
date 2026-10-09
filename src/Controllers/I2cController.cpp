@@ -11,6 +11,7 @@ I2cController::I2cController(
     IInput& terminalInput,
     IUtilityService& utilityService,
     II2cService& i2cService,
+    II2cSnifferService& i2cSnifferService,
     ArgTransformer& argTransformer,
     UserInputManager& userInputManager,
     II2cEepromShell& eepromShell,
@@ -20,6 +21,7 @@ I2cController::I2cController(
       terminalInput(terminalInput),
       utilityService(utilityService),
       i2cService(i2cService),
+      i2cSnifferService(i2cSnifferService),
       argTransformer(argTransformer),
       userInputManager(userInputManager),
       eepromShell(eepromShell),
@@ -122,21 +124,20 @@ void I2cController::handleSniff(const TerminalCommand& cmd) {
         terminalView.println("I2C Sniffer: Listening on SCL/SDA... Press [ENTER] to stop.\n");
     }
 
-    i2c_sniffer_set_address_filter(filterEnabled, filterAddress);
-    i2c_sniffer_begin(state.getI2cSclPin(), state.getI2cSdaPin()); // dont need freq to work
-    if (!i2c_sniffer_setup()) {
-        // setup() may already have allocated some lazy buffers before a later
-        // MCPWM allocation fails. Release everything immediately so a failed
-        // sniff attempt never leaves heap reserved.
-        i2c_sniffer_release();
-        i2c_sniffer_set_address_filter(false, 0);
+    i2cSnifferService.setAddressFilter(filterEnabled, filterAddress);
+    i2cSnifferService.begin(state.getI2cSclPin(), state.getI2cSdaPin()); // dont need freq to work
+    if (!i2cSnifferService.setup()) {
+        i2cSnifferService.setAddressFilter(false, 0);
         i2cService.configure(state.getI2cSdaPin(), state.getI2cSclPin(), state.getI2cFrequency());
-        terminalView.println("I2C Sniffer: Failed to allocate capture buffers or MCPWM capture hardware.");
+        terminalView.println(std::string("I2C Sniffer: ") + i2cSnifferService.backendName() +
+                             " initialization failed: " + i2cSnifferService.lastError());
         return;
     }
 
-    std::string line;
-    line.reserve(256);
+    // Lazy CLI output buffer: only reserve RAM after the first successful
+    // sniff initialization, then reuse its capacity until I2C mode exit.
+    if (sniffLine.capacity() < 256) sniffLine.reserve(256);
+    sniffLine.clear();
 
     while (true) {
         char key = terminalInput.readChar();
@@ -146,25 +147,25 @@ void I2cController::handleSniff(const TerminalCommand& cmd) {
         // input poll so ENTER can still stop a continuously busy I2C bus.
         size_t charsThisPass = 0;
         static constexpr size_t MAX_CHARS_PER_PASS = 512;
-        while (charsThisPass < MAX_CHARS_PER_PASS && i2c_sniffer_available()) {
-            char c = i2c_sniffer_read();
+        while (charsThisPass < MAX_CHARS_PER_PASS && i2cSnifferService.available()) {
+            char c = i2cSnifferService.read();
             charsThisPass++;
 
             if (c == '\n') {
-                line += "  ";
-                terminalView.println(line);
-                line.clear();
+                sniffLine += "  ";
+                terminalView.println(sniffLine);
+                sniffLine.clear();
             } else if (c != '\0') {
-                line += c;
+                sniffLine += c;
             }
         }
     }
 
-    // Stop capture hardware but keep the lazy sniffer buffers allocated while
-    // we remain in I2C mode. They are reused by the next sniff command and are
-    // released by ensureReleased() when leaving I2C mode.
-    i2c_sniffer_stop();
-    i2c_sniffer_set_address_filter(false, 0);
+    // Stop IRQ capture before clearing the rings so a late edge cannot refill
+    // a buffer that is supposed to belong to the next sniff session.
+    i2cSnifferService.stop();
+    i2cSnifferService.resetBuffer();
+    i2cSnifferService.setAddressFilter(false, 0);
     i2cService.configure(state.getI2cSdaPin(), state.getI2cSclPin(), state.getI2cFrequency());
     terminalView.println("\n\nI2C Sniffer: Stopped.");
 }
@@ -1380,6 +1381,7 @@ void I2cController::ensureConfigured() {
     if (!configured) {
         handleConfig();
         configured = true;
+        // Sniffer resources stay unallocated until the first sniff command.
         return;
     }
 
@@ -1397,7 +1399,8 @@ void I2cController::ensureConfigured() {
 Release lazy I2C resources
 */
 void I2cController::ensureReleased() {
-    i2c_sniffer_release();
+    i2cSnifferService.release();
+    std::string().swap(sniffLine); // release CLI text capacity on mode exit
     i2cService.end();
     configured = false;
 }

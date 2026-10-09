@@ -1,6 +1,6 @@
 #include <unity.h>
 
-#include "Vendors/FakeI2cSniffer.h"
+#include "Services/FakeI2cSnifferService.h"
 #include "States/TestGlobalState.h"
 
 // Production units exercised by the native test runner.
