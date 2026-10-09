@@ -479,12 +479,28 @@ void test_frequency_waits_without_timeout_and_restores_bus_without_changing_spee
     TEST_ASSERT_EQUAL_UINT32(100000, fixture.i2cService.configurations[0].frequency);
     TEST_ASSERT_EQUAL_UINT32(100000, GlobalState::getInstance().getI2cFrequency());
     TEST_ASSERT_TRUE(fixture.i2cService.beginAddresses.empty());
-    TEST_ASSERT_TRUE(fixture.view.contains("SCL: GPIO 1"));
-    TEST_ASSERT_TRUE(fixture.view.contains("Listening... ENTER to stop."));
+    TEST_ASSERT_TRUE(fixture.view.contains("I2C Freq: Listening"));
+    TEST_ASSERT_TRUE(fixture.view.contains("[ENTER] to stop"));
     TEST_ASSERT_TRUE(fixture.view.contains("Freq: 400.00 kHz"));
     TEST_ASSERT_TRUE(fixture.view.contains("LOW: 1.50 us"));
     TEST_ASSERT_TRUE(fixture.view.contains("HIGH: 1.00 us"));
     TEST_ASSERT_TRUE(fixture.view.contains("Cycles: 27/30"));
+    TEST_ASSERT_TRUE(fixture.view.contains("Save frequency to the configuration? [n]"));
+    TEST_ASSERT_FALSE(fixture.view.contains("Frequency saved"));
+}
+
+void test_frequency_saves_detected_speed_only_after_confirmation() {
+    for (bool confirm : {false, true}) {
+        I2cControllerFixture fixture;
+        fixture.snifferService.frequencyResult = {true, 30, 27, 400000, 2.5, 1.5, 1.0};
+        fixture.input.queueLine(confirm ? "y" : "n");
+
+        fixture.controller.handleCommand(TerminalCommand("freq"));
+
+        TEST_ASSERT_EQUAL_UINT32(confirm ? 400000 : 100000,
+                                GlobalState::getInstance().getI2cFrequency());
+        TEST_ASSERT_EQUAL(confirm, fixture.view.contains("Frequency saved to configuration."));
+    }
 }
 
 void test_frequency_reports_unreliable_capture() {
@@ -516,9 +532,10 @@ void test_frequency_failure_and_enter_cancellation_restore_bus() {
         fixture.input.queueReadChar('\n');
         fixture.controller.handleCommand(TerminalCommand("freq"));
         TEST_ASSERT_EQUAL_UINT32(1, fixture.i2cService.configurations.size());
-        TEST_ASSERT_TRUE(fixture.view.contains(fail ? "Freq error:" : "Freq: Stopped."));
+        TEST_ASSERT_TRUE(fixture.view.contains(fail ? "Freq error:" : "Stopped by user."));
         TEST_ASSERT_EQUAL(!fail, fixture.snifferService.frequencyCancelled);
         TEST_ASSERT_FALSE(fixture.view.contains("kHz"));
+        TEST_ASSERT_FALSE(fixture.view.contains("Save frequency"));
     }
 }
 
@@ -592,6 +609,7 @@ void runI2cControllerTests() {
     RUN_TEST(test_sniff_uses_current_pins_then_reconfigures_service);
     RUN_TEST(test_sniff_applies_address_filter_then_clears_it);
     RUN_TEST(test_frequency_waits_without_timeout_and_restores_bus_without_changing_speed);
+    RUN_TEST(test_frequency_saves_detected_speed_only_after_confirmation);
     RUN_TEST(test_frequency_reports_unreliable_capture);
     RUN_TEST(test_frequency_rejects_arguments_without_touching_bus);
     RUN_TEST(test_frequency_failure_and_enter_cancellation_restore_bus);
