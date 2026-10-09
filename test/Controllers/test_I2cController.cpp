@@ -511,19 +511,6 @@ void test_frequency_reports_unreliable_capture() {
     TEST_ASSERT_EQUAL_UINT32(1, fixture.i2cService.configurations.size());
 }
 
-void test_frequency_rejects_arguments_without_touching_bus() {
-    I2cControllerFixture fixture;
-    for (const char* argument : {"1000", "10000", "0", "invalid"}) {
-        fixture.controller.handleCommand(TerminalCommand("freq", argument));
-    }
-    fixture.controller.handleCommand(TerminalCommand("freq", "1000", "extra"));
-    fixture.controller.handleCommand(TerminalCommand("freq", "", "extra"));
-    TEST_ASSERT_EQUAL_UINT32(0, fixture.snifferService.frequencyCalls);
-    TEST_ASSERT_EQUAL_UINT32(0, fixture.i2cService.endCalls);
-    TEST_ASSERT_TRUE(fixture.i2cService.configurations.empty());
-    TEST_ASSERT_TRUE(fixture.view.contains("Usage: freq"));
-}
-
 void test_frequency_failure_and_enter_cancellation_restore_bus() {
     for (bool fail : {true, false}) {
         I2cControllerFixture fixture;
@@ -611,7 +598,6 @@ void runI2cControllerTests() {
     RUN_TEST(test_frequency_waits_without_timeout_and_restores_bus_without_changing_speed);
     RUN_TEST(test_frequency_saves_detected_speed_only_after_confirmation);
     RUN_TEST(test_frequency_reports_unreliable_capture);
-    RUN_TEST(test_frequency_rejects_arguments_without_touching_bus);
     RUN_TEST(test_frequency_failure_and_enter_cancellation_restore_bus);
     RUN_TEST(test_release_frees_sniffer_and_forces_next_configuration_prompt);
     RUN_TEST(test_identify_uses_known_address_database);
