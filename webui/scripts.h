@@ -1538,7 +1538,7 @@ function initTerminalBanner() {
   | |_) | | |_  |  __/| | | | (_| | ||  __/
   |____/|_|\\__| |_|   |_|_|  \\__,_|\\__\\___|
 
-    Version 1.7           Ready to board
+    Version 1.8           Ready to board
 
  Type 'mode' to start or 'help' for commands
 
